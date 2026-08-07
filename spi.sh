@@ -8,7 +8,10 @@ log() {
 
 test_spi_flash() {
     local rc_all=0
-    local mtd_list=("/dev/mtdblock0" "/dev/mtdblock1")
+    # Only one SPI NOR exists on the hardware: U14 (BY25D40ESTIG, 4Mbit) on
+    # SPI3_M2 CS0, see base board sheet 10. The second MTD device came from the
+    # old device tree, which declared a flash on &spi1 with no matching part.
+    local mtd_list=("/dev/mtdblock0")
     local idx=0
 
     for MTD_DEV in "${mtd_list[@]}"; do
