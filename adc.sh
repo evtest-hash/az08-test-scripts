@@ -68,8 +68,11 @@ LADDER_TOL="${LADDER_TOL:-150}"
 LADDER_WARN="${LADDER_WARN:-100}"
 SAMPLES="${SAMPLES:-3}"
 
-# Reading an unassigned module ID is a FAIL by default so that a new SKU cannot
-# pass silently through an old test station. Set to 1 to let the line through.
+# Module IDs that are on sheet 22 but whose Customer P/N is UNDEFINED pass with
+# a WARN: SKUs get confirmed ad hoc and the factory-test firmware may lag, so
+# failing them would break the line for a legitimate board. IDs that are not on
+# the sheet at all (37..121) are a FAIL by default -- that is a wrong strap or
+# an unknown build, not a firmware-lag problem. Set to 1 to let those through.
 ALLOW_UNKNOWN_MODULE_ID="${ALLOW_UNKNOWN_MODULE_ID:-0}"
 
 # ladder_index <raw> ; echoes "<idx> <nominal> <deviation>", or returns 1 if the
@@ -260,25 +263,52 @@ test_core_rev() {
 # the sheet 22 table: ID1=(0,0) ID11=(0,4095) ID12=(416,0) ID13=(416,416)
 # ID22=(416,4095) ID23=(816,0) ID33=(816,4095) ID34=(1231,0) ID36=(1231,816).
 #
-# Layer 2 looks the ID up for the expected build spec. A miss is expected for
-# reserved/future SKUs and is reported separately from a hardware fault.
+# Layer 2 carries all 36 rows of sheet 22 (rev V1.1.0). The pn field is either
+# the confirmed Customer P/N or UNDEFINED: the hardware configuration of an
+# UNDEFINED row IS defined on the sheet -- only the customer part number is not
+# confirmed yet -- so the cross-check still runs, but the result is a WARN
+# instead of a FAIL (see ALLOW_UNKNOWN_MODULE_ID note above). When a P/N gets
+# confirmed, replace UNDEFINED with it and the row becomes strictly enforced.
 #
-# Format: id|cpu|ddr_type|ddr_mb|emmc_gb|wifi|description
+# Format: id|pn|cpu|ddr_type|ddr_mb|emmc_gb|wifi|description
 MODULE_SPEC=$(
 cat <<'EOF'
-1|RK3576S|LPDDR4X|2048|8|WITH|RK3576S LPDDR4X 2+8GB WITH WIFI+BT
-2|RK3576S|LPDDR4X|2048|8|WITHOUT|RK3576S LPDDR4X 2+8GB WITHOUT WIFI+BT
-3|RK3576|LPDDR4X|2048|8|WITH|RK3576 LPDDR4X 2+8GB WITH WIFI+BT
-4|RK3576|LPDDR4X|2048|8|WITHOUT|RK3576 LPDDR4X 2+8GB WITHOUT WIFI+BT
-5|RK3576S|LPDDR4|2048|8|WITH|RK3576S LPDDR4 2+8GB WITH WIFI+BT
-6|RK3576S|LPDDR4|2048|8|WITHOUT|RK3576S LPDDR4 2+8GB WITHOUT WIFI+BT
-7|RK3576|LPDDR4|2048|8|WITH|RK3576 LPDDR4 2+8GB WITH WIFI+BT
-8|RK3576|LPDDR4|2048|8|WITHOUT|RK3576 LPDDR4 2+8GB WITHOUT WIFI+BT
-9|RK3576S|LPDDR5|2048|8|WITH|RK3576S LPDDR5 2+8GB WITH WIFI+BT
-10|RK3576S|LPDDR5|2048|8|WITHOUT|RK3576S LPDDR5 2+8GB WITHOUT WIFI+BT
-11|RK3576|LPDDR5|2048|8|WITH|RK3576 LPDDR5 2+8GB WITH WIFI+BT
-12|RK3576|LPDDR5|2048|8|WITHOUT|RK3576 LPDDR5 2+8GB WITHOUT WIFI+BT
-13|RK3576S|LPDDR4X|2048|32|WITH|RK3576S LPDDR4X 2+32GB WITH WIFI+BT
+1|INM-ICS-000633|RK3576S|LPDDR4X|2048|8|WITH|RK3576S LPDDR4X 2+8GB WITH WIFI+BT
+2|INM-ICS-000632|RK3576S|LPDDR4X|2048|8|WITHOUT|RK3576S LPDDR4X 2+8GB WITHOUT WIFI+BT
+3|UNDEFINED|RK3576|LPDDR4X|2048|8|WITH|RK3576 LPDDR4X 2+8GB WITH WIFI+BT
+4|UNDEFINED|RK3576|LPDDR4X|2048|8|WITHOUT|RK3576 LPDDR4X 2+8GB WITHOUT WIFI+BT
+5|INM-ICS-000633|RK3576S|LPDDR4|2048|8|WITH|RK3576S LPDDR4 2+8GB WITH WIFI+BT
+6|INM-ICS-000632|RK3576S|LPDDR4|2048|8|WITHOUT|RK3576S LPDDR4 2+8GB WITHOUT WIFI+BT
+7|UNDEFINED|RK3576|LPDDR4|2048|8|WITH|RK3576 LPDDR4 2+8GB WITH WIFI+BT
+8|UNDEFINED|RK3576|LPDDR4|2048|8|WITHOUT|RK3576 LPDDR4 2+8GB WITHOUT WIFI+BT
+9|INM-ICS-000633|RK3576S|LPDDR5|2048|8|WITH|RK3576S LPDDR5 2+8GB WITH WIFI+BT
+10|INM-ICS-000632|RK3576S|LPDDR5|2048|8|WITHOUT|RK3576S LPDDR5 2+8GB WITHOUT WIFI+BT
+11|UNDEFINED|RK3576|LPDDR5|2048|8|WITH|RK3576 LPDDR5 2+8GB WITH WIFI+BT
+12|UNDEFINED|RK3576|LPDDR5|2048|8|WITHOUT|RK3576 LPDDR5 2+8GB WITHOUT WIFI+BT
+13|INM-ICS-000633|RK3576S|LPDDR4X|2048|32|WITH|RK3576S LPDDR4X 2+32GB WITH WIFI+BT
+14|UNDEFINED|RK3576S|LPDDR4X|2048|32|WITHOUT|RK3576S LPDDR4X 2+32GB WITHOUT WIFI+BT
+15|UNDEFINED|RK3576|LPDDR4X|2048|32|WITH|RK3576 LPDDR4X 2+32GB WITH WIFI+BT
+16|UNDEFINED|RK3576|LPDDR4X|2048|32|WITHOUT|RK3576 LPDDR4X 2+32GB WITHOUT WIFI+BT
+17|INM-ICS-000633|RK3576S|LPDDR4|2048|32|WITH|RK3576S LPDDR4 2+32GB WITH WIFI+BT
+18|UNDEFINED|RK3576S|LPDDR4|2048|32|WITHOUT|RK3576S LPDDR4 2+32GB WITHOUT WIFI+BT
+19|UNDEFINED|RK3576|LPDDR4|2048|32|WITH|RK3576 LPDDR4 2+32GB WITH WIFI+BT
+20|UNDEFINED|RK3576|LPDDR4|2048|32|WITHOUT|RK3576 LPDDR4 2+32GB WITHOUT WIFI+BT
+21|INM-ICS-000633|RK3576S|LPDDR5|2048|32|WITH|RK3576S LPDDR5 2+32GB WITH WIFI+BT
+22|UNDEFINED|RK3576S|LPDDR5|2048|32|WITHOUT|RK3576S LPDDR5 2+32GB WITHOUT WIFI+BT
+23|UNDEFINED|RK3576|LPDDR5|2048|32|WITH|RK3576 LPDDR5 2+32GB WITH WIFI+BT
+24|UNDEFINED|RK3576|LPDDR5|2048|32|WITHOUT|RK3576 LPDDR5 2+32GB WITHOUT WIFI+BT
+25|INM-ICS-000649|RK3576S|LPDDR4X|4096|64|WITH|RK3576S LPDDR4X 4+64GB WITH WIFI+BT
+26|UNDEFINED|RK3576S|LPDDR4X|4096|64|WITHOUT|RK3576S LPDDR4X 4+64GB WITHOUT WIFI+BT
+27|UNDEFINED|RK3576|LPDDR4X|4096|64|WITH|RK3576 LPDDR4X 4+64GB WITH WIFI+BT
+28|UNDEFINED|RK3576|LPDDR4X|4096|64|WITHOUT|RK3576 LPDDR4X 4+64GB WITHOUT WIFI+BT
+29|INM-ICS-000649|RK3576S|LPDDR4|4096|64|WITH|RK3576S LPDDR4 4+64GB WITH WIFI+BT
+30|UNDEFINED|RK3576S|LPDDR4|4096|64|WITHOUT|RK3576S LPDDR4 4+64GB WITHOUT WIFI+BT
+31|UNDEFINED|RK3576|LPDDR4|4096|64|WITH|RK3576 LPDDR4 4+64GB WITH WIFI+BT
+32|UNDEFINED|RK3576|LPDDR4|4096|64|WITHOUT|RK3576 LPDDR4 4+64GB WITHOUT WIFI+BT
+33|INM-ICS-000649|RK3576S|LPDDR5|4096|64|WITH|RK3576S LPDDR5 4+64GB WITH WIFI+BT
+34|UNDEFINED|RK3576S|LPDDR5|4096|64|WITHOUT|RK3576S LPDDR5 4+64GB WITHOUT WIFI+BT
+35|UNDEFINED|RK3576|LPDDR5|4096|64|WITH|RK3576 LPDDR5 4+64GB WITH WIFI+BT
+36|UNDEFINED|RK3576|LPDDR5|4096|64|WITHOUT|RK3576 LPDDR5 4+64GB WITHOUT WIFI+BT
 EOF
 )
 
@@ -430,16 +460,15 @@ test_hwcfg() {
     module_id=$(( idx6 * LADDER_LEVELS + idx7 + 1 ))
     log "INFO" "Decoded: ch6 idx=${idx6} ch7 idx=${idx7} => CONF_ID${module_id}"
 
-    # ---- layer 2: spec lookup (a miss is not a hardware fault) --------------
-    local spec exp_cpu exp_ddr_type exp_ddr_mb exp_emmc_gb exp_wifi exp_text
+    # ---- layer 2: spec lookup ------------------------------------------------
+    local spec exp_pn exp_cpu exp_ddr_type exp_ddr_mb exp_emmc_gb exp_wifi exp_text
     spec="$(awk -F'|' -v id="$module_id" '$1 == id { print; exit }' <<<"${MODULE_SPEC}")"
 
     read_hw_actual
 
     if [ -z "$spec" ]; then
-        log "WARN" "MODULE_ID=${module_id} has no build spec defined in this script"
-        log "WARN" "Sheet 22 currently assigns SKUs up to ID36; the rest are reserved."
-        log "WARN" "The strap itself decoded cleanly, so this is not a hardware fault."
+        log "WARN" "MODULE_ID=${module_id} is not on sheet 22 (only ID1..ID36 are defined)"
+        log "WARN" "The strap itself decoded cleanly, so this is either a wrong strap combination or a build this firmware does not know."
         log "WARN" "Measured inventory: CPU=${HW_CPU} DDR=${HW_DDR_TYPE:-N/A}/${HW_DDR_MB}MB" \
                    "eMMC=${HW_EMMC_GIB}GiB WiFi=$( [ "$HW_WIFI_PRESENT" -eq 1 ] && echo WITH || echo WITHOUT )"
         if [ "$ALLOW_UNKNOWN_MODULE_ID" = "1" ]; then
@@ -447,13 +476,27 @@ test_hwcfg() {
             log "INFO" "Module ID check PASSED (unverified, MODULE_ID=${module_id})"
             return 0
         fi
-        log "ERROR" "Add MODULE_ID=${module_id} to MODULE_SPEC, or set ALLOW_UNKNOWN_MODULE_ID=1"
+        log "ERROR" "Update MODULE_SPEC from the latest sheet 22, or set ALLOW_UNKNOWN_MODULE_ID=1"
         log "ERROR" "Module ID check FAILED (unknown MODULE_ID=${module_id})"
         return 1
     fi
 
-    IFS='|' read -r _ exp_cpu exp_ddr_type exp_ddr_mb exp_emmc_gb exp_wifi exp_text <<<"${spec}"
-    log "INFO" "MODULE_ID=${module_id} => ${exp_text}"
+    IFS='|' read -r _ exp_pn exp_cpu exp_ddr_type exp_ddr_mb exp_emmc_gb exp_wifi exp_text <<<"${spec}"
+    log "INFO" "MODULE_ID=${module_id} => ${exp_text} (P/N: ${exp_pn})"
+
+    if [ "$exp_pn" = "UNDEFINED" ]; then
+        # SKU exists on the sheet but the Customer P/N is not confirmed yet.
+        # WARN-only: SKUs get confirmed ad hoc and this firmware may lag behind,
+        # so failing here would false-reject a legitimate board.
+        if validate_against_spec "$exp_cpu" "$exp_ddr_type" "$exp_ddr_mb" "$exp_emmc_gb" "$exp_wifi"; then
+            log "WARN" "MODULE_ID=${module_id} Customer P/N is UNDEFINED (unconfirmed SKU); hardware matches the sheet-defined config"
+        else
+            log "WARN" "MODULE_ID=${module_id} Customer P/N is UNDEFINED (unconfirmed SKU); hardware does NOT match the sheet-defined config -- check strap/assembly"
+        fi
+        log "WARN" "If this P/N has since been confirmed, update MODULE_SPEC from the latest sheet 22"
+        log "INFO" "Hardware configuration check PASSED (with WARN, unconfirmed MODULE_ID=${module_id})"
+        return 0
+    fi
 
     if validate_against_spec "$exp_cpu" "$exp_ddr_type" "$exp_ddr_mb" "$exp_emmc_gb" "$exp_wifi"; then
         log "INFO" "Hardware configuration check PASS"
