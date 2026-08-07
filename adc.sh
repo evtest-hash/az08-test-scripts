@@ -19,6 +19,111 @@ find_adc_dev() {
     return 1
 }
 
+# ---- SARADC resistor ladder (core board sheet 22) ----------------------------
+#
+# Every ID/config strap on the core board uses the same divider ladder off
+# VCCA1V8_PLDO2_S0. Rup is 10K for every level except index 0 (Rup = NC, so the
+# node is pulled to GND) and index 10 (Rdown = NC, so it is pulled to VREF).
+#
+#   idx  Rup / Rdown     ADC
+#   ---  -------------   ----
+#    0   NC   / 10K         0
+#    1   10K  / 1.13K     416
+#    2   10K  / 2.49K     816
+#    3   10K  / 4.3K     1231
+#    4   10K  / 6.8K     1658
+#    5   10K  / 10K      2048
+#    6   10K  / 14.7K    2437
+#    7   10K  / 23.2K    2862
+#    8   10K  / 40.2K    3279
+#    9   10K  / 88.7K    3680
+#   10   10K  / NC       4095
+#
+# The readings are ratiometric: the top of every divider and the ADC reference
+# are the same rail (VCCA1V8_PLDO2_S0 feeds SARADC_AVDD1V8, ball 2A10), so
+#     code = 4096 * Rdown / (Rup + Rdown)
+# and the absolute accuracy of the 1.8V rail drops out of the error budget.
+#
+# Error budget, in ADC counts:
+#   resistor tolerance (both +-1%, worst case opposing)  +-20  (max at k=0.5)
+#   SARADC INL/DNL + offset                              +-30
+#   noise (SAMPLES averaging, 1nF on the input)          +-10
+#   divider source impedance x ADC input leakage         +-20
+#   -> linear sum +-80, RSS +-42
+#
+# The smallest gap between adjacent levels is 389 counts (2048 -> 2437), so the
+# accept window cannot exceed 389/2 = 194. LADDER_TOL=150 is 3.6x the RSS budget
+# and still rejects a wrong strap resistor (>=389 off, i.e. >=239 outside the
+# window). LADDER_WARN flags readings that decode cleanly but sit further from
+# nominal than expected -- collect the real spread on the line before tightening
+# LADDER_TOL, rather than guessing.
+#
+# NOTE: idx 0 is "Rup = NC" and idx 10 is "Rdown = NC", so an unfitted resistor
+# decodes as a legitimate level rather than a fault. No tolerance can catch
+# that; the module ID cross-check covers part of it, HW_ID has nothing to
+# cross-check against.
+LADDER="0 416 816 1231 1658 2048 2437 2862 3279 3680 4095"
+LADDER_LEVELS=11
+LADDER_TOL="${LADDER_TOL:-150}"
+LADDER_WARN="${LADDER_WARN:-100}"
+SAMPLES="${SAMPLES:-3}"
+
+# Reading an unassigned module ID is a FAIL by default so that a new SKU cannot
+# pass silently through an old test station. Set to 1 to let the line through.
+ALLOW_UNKNOWN_MODULE_ID="${ALLOW_UNKNOWN_MODULE_ID:-0}"
+
+# ladder_index <raw> ; echoes "<idx> <nominal> <deviation>", or returns 1 if the
+# reading is not within LADDER_TOL of any level
+ladder_index() {
+    awk -v raw="$1" -v tol="$LADDER_TOL" -v ladder="$LADDER" '
+        BEGIN {
+            n = split(ladder, L, " ")
+            best = -1; bestd = 1e9
+            for (i = 1; i <= n; i++) {
+                d = raw - L[i]; if (d < 0) d = -d
+                if (d < bestd) { bestd = d; best = i - 1 }
+            }
+            if (bestd > tol) exit 1
+            printf "%d %d %.1f\n", best, L[best + 1], bestd
+        }'
+}
+
+# report_ladder <label> <idx> <nominal> <deviation>
+report_ladder() {
+    log "INFO" "$1: idx=$2 nominal=$3 deviation=$4 counts (tol=+-${LADDER_TOL})"
+    if awk -v d="$4" -v w="$LADDER_WARN" 'BEGIN{ exit !(d > w) }'; then
+        log "WARN" "$1: deviation $4 exceeds ${LADDER_WARN} counts -- decodes cleanly but is marginal, worth tracking"
+    fi
+}
+
+# adc_sample <dev> <channel> <samples> ; echoes "n avg min max"
+adc_sample() {
+    local dev="$1" ch="$2" samples="$3"
+    {
+        local i=0 v
+        while [ "$i" -lt "$samples" ]; do
+            v="$(cat "${dev}/in_voltage${ch}_raw" 2>/dev/null || echo "")"
+            echo "$v" | grep -qE '^[0-9]+$' && echo "$v"
+            i=$((i + 1))
+            usleep 50000 2>/dev/null || sleep 0.05
+        done
+    } | awk '
+        BEGIN { min = 1e9; max = -1 }
+        NF { v = $1 + 0; n++; sum += v; if (v < min) min = v; if (v > max) max = v }
+        END {
+            if (n == 0) { print "0 0 0 0"; exit }
+            printf "%d %.2f %d %d\n", n, sum / n, min, max
+        }'
+}
+
+check_samples() {
+    if ! echo "$SAMPLES" | grep -qE '^[0-9]+$' || [ "$SAMPLES" -le 0 ]; then
+        log "ERROR" "SAMPLES must be a positive integer"
+        return 1
+    fi
+    return 0
+}
+
 test_adc_voltage() {
     log "INFO" "==> ADC voltage test (channel 3, 4, 5)"
 
@@ -78,91 +183,113 @@ test_adc_voltage() {
     fi
 }
 
-test_hwcfg() {
-    log "INFO" "==> Hardware configuration check (channel 6, 7)"
+# ---- core board revision (channel 2, SARADC_VIN2_HW_ID) ----------------------
+#
+# The HW_ID strap uses the same ladder and sheet 22 assigns all 11 levels.
+# HW_ID number = idx + 1, but the VERSION column is NOT a formula: it runs
+# V1.0.0..V1.9.0 and then rolls over to V2.0.0 at the last level, so it has to
+# be a lookup.
+#
+#   sheet row   Rup / Rdown     ADC    VERSION   idx
+#   ---------   -------------   ----   -------   ---
+#   HW_ID1      NC   / 10K         0   V1.0.0     0
+#   HW_ID2      10K  / 1.13K     416   V1.1.0     1
+#   HW_ID3      10K  / 2.49K     816   V1.2.0     2
+#   HW_ID4      10K  / 4.3K     1231   V1.3.0     3
+#   HW_ID5      10K  / 6.8K     1658   V1.4.0     4
+#   HW_ID6      10K  / 10K      2048   V1.5.0     5
+#   HW_ID7      10K  / 14.7K    2437   V1.6.0     6
+#   HW_ID8      10K  / 23.2K    2862   V1.7.0     7
+#   HW_ID9      10K  / 40.2K    3279   V1.8.0     8
+#   HW_ID10     10K  / 88.7K    3680   V1.9.0     9
+#   HW_ID11     10K  / NC       4095   V2.0.0    10
+HW_ID_VERSIONS="V1.0.0 V1.1.0 V1.2.0 V1.3.0 V1.4.0 V1.5.0 V1.6.0 V1.7.0 V1.8.0 V1.9.0 V2.0.0"
+CORE_REV=""
+CORE_HW_ID=""
 
-    local samples="${1:-${SAMPLES:-3}}"
-    if ! echo "$samples" | grep -qE '^[0-9]+$'; then
-        log "ERROR" "SAMPLES must be integer"
-        return 1
-    fi
-    if [ "$samples" -le 0 ]; then
-        log "ERROR" "SAMPLES must be > 0"
-        return 1
-    fi
+test_core_rev() {
+    log "INFO" "==> Core board revision (channel 2, SARADC_VIN2_HW_ID)"
 
-    local conf_table
-    conf_table=$(
-    cat <<'EOF'
-CONF_ID1|0|0|RK3576S|LPDDR4X|2048|8|WITH|RK3576S LPDDR4X 2+8GB WITH WIFI+BT
-CONF_ID2|0|416|RK3576S|LPDDR4X|2048|8|WITHOUT|RK3576S LPDDR4X 2+8GB WITHOUT WIFI+BT
-CONF_ID3|0|816|RK3576|LPDDR4X|2048|8|WITH|RK3576 LPDDR4X 2+8GB WITH WIFI+BT
-CONF_ID4|0|1231|RK3576|LPDDR4X|2048|8|WITHOUT|RK3576 LPDDR4X 2+8GB WITHOUT WIFI+BT
-CONF_ID5|0|1658|RK3576S|LPDDR4|2048|8|WITH|RK3576S LPDDR4 2+8GB WITH WIFI+BT
-CONF_ID6|0|2048|RK3576S|LPDDR4|2048|8|WITHOUT|RK3576S LPDDR4 2+8GB WITHOUT WIFI+BT
-CONF_ID7|0|2437|RK3576|LPDDR4|2048|8|WITH|RK3576 LPDDR4 2+8GB WITH WIFI+BT
-CONF_ID8|0|2862|RK3576|LPDDR4|2048|8|WITHOUT|RK3576 LPDDR4 2+8GB WITHOUT WIFI+BT
-CONF_ID9|0|3279|RK3576S|LPDDR5|2048|8|WITH|RK3576S LPDDR5 2+8GB WITH WIFI+BT
-CONF_ID10|0|3680|RK3576S|LPDDR5|2048|8|WITHOUT|RK3576S LPDDR5 2+8GB WITHOUT WIFI+BT
-CONF_ID11|0|4095|RK3576|LPDDR5|2048|8|WITH|RK3576 LPDDR5 2+8GB WITH WIFI+BT
-CONF_ID12|416|0|RK3576|LPDDR5|2048|8|WITHOUT|RK3576 LPDDR5 2+8GB WITHOUT WIFI+BT
-EOF
-    )
+    check_samples || return 1
 
-    # Find ADC device with channel 6, 7
     local adc_dev
-    adc_dev="$(find_adc_dev 6 7 || true)"
+    adc_dev="$(find_adc_dev 2 2 || true)"
     if [ -z "$adc_dev" ]; then
-        log "ERROR" "No IIO ADC node with voltage6~7 found"
+        log "ERROR" "No IIO ADC node with voltage2 found"
         return 1
     fi
 
-    # Sample ADC channels 6 and 7
-    local n adc6_avg adc7_avg adc6_min adc6_max adc7_min adc7_max
-    read -r n adc6_avg adc7_avg adc6_min adc6_max adc7_min adc7_max <<<"$(
-      i=0
-      while [ "$i" -lt "$samples" ]; do
-        v6="$(cat "$adc_dev/in_voltage6_raw" 2>/dev/null || echo "")"
-        v7="$(cat "$adc_dev/in_voltage7_raw" 2>/dev/null || echo "")"
-        echo "$v6" | grep -qE '^[0-9]+$' && echo "$v7" | grep -qE '^[0-9]+$' && echo "$v6 $v7"
-        i=$((i + 1))
-        usleep 50000 2>/dev/null || sleep 0.05
-      done | awk '
-        BEGIN { min6=1e9; min7=1e9; max6=-1; max7=-1; }
-        NF>=2 {
-          v6=$1+0; v7=$2+0; n++; sum6+=v6; sum7+=v7;
-          if (v6<min6) min6=v6; if (v6>max6) max6=v6;
-          if (v7<min7) min7=v7; if (v7>max7) max7=v7;
-        }
-        END {
-          if (n==0) { print 0,0,0,0,0,0,0; exit }
-          printf "%d %.2f %.2f %d %d %d %d\n", n, sum6/n, sum7/n, min6, max6, min7, max7;
-        }'
-    )"
-    if [ -z "$n" ] || ! echo "$n" | grep -qE '^[0-9]+$' || [ "$n" -eq 0 ]; then
-        log "ERROR" "No valid channel 6, 7 sample"
+    local n avg vmin vmax
+    read -r n avg vmin vmax <<<"$(adc_sample "$adc_dev" 2 "$SAMPLES")"
+    if [ "$n" -eq 0 ]; then
+        log "ERROR" "No valid channel 2 sample"
         return 1
     fi
-    log "INFO" "Channel 6/7 samples: n=$n avg=($adc6_avg, $adc7_avg) range6=[$adc6_min..$adc6_max] range7=[$adc7_min..$adc7_max]"
+    log "INFO" "Channel 2 samples: n=$n avg=$avg range=[$vmin..$vmax]"
 
-    # Match ADC values to config table
-    local best_raw best_id best_a6 best_a7 best_cpu best_ddr_type best_ddr_mb best_emmc_gb best_wifi best_text best_score second_score
-    best_raw="$(
-      awk -F'|' -v v6="${adc6_avg}" -v v7="${adc7_avg}" '
-        BEGIN { best=999999999999; second=999999999999; best_line="" }
-        {
-          d6=v6-$2; d7=v7-$3; score=d6*d6+d7*d7
-          if (score < best) { second=best; best=score; best_line=$0 }
-          else if (score < second) { second=score }
-        }
-        END { printf "%s|%.4f|%.4f\n", best_line, best, second }' <<<"${conf_table}"
-    )"
-    IFS='|' read -r best_id best_a6 best_a7 best_cpu best_ddr_type best_ddr_mb best_emmc_gb best_wifi best_text best_score second_score <<<"${best_raw}"
+    local decoded idx nominal dev
+    if ! decoded="$(ladder_index "$avg")"; then
+        log "ERROR" "Channel 2 raw=$avg is not on the resistor ladder (tolerance +-${LADDER_TOL})"
+        log "ERROR" "HW_ID strap resistor is wrong/unfitted, or the ADC input is faulty"
+        return 1
+    fi
+    read -r idx nominal dev <<<"$decoded"
+    report_ladder "Channel 2 (HW_ID)" "$idx" "$nominal" "$dev"
 
-    log "INFO" "Config match: $best_id target=($best_a6, $best_a7) score=$best_score second=$second_score"
-    log "INFO" "Hardware configuration: $best_text"
+    CORE_HW_ID="HW_ID$((idx + 1))"
+    CORE_REV="$(awk -v i="$idx" '{print $(i + 1)}' <<<"$HW_ID_VERSIONS")"
+    if [ -z "$CORE_REV" ]; then
+        log "ERROR" "${CORE_HW_ID} (idx=${idx}) has no version in HW_ID_VERSIONS"
+        return 1
+    fi
+    log "INFO" "Decoded: ${CORE_HW_ID} => core board revision ${CORE_REV}"
 
-    # Read OTP byte 8 for CPU identification
+    log "INFO" "Core board revision check PASSED (${CORE_HW_ID} / ${CORE_REV})"
+    return 0
+}
+
+# ---- module ID (channel 6 + 7) ----------------------------------------------
+#
+# Layer 1 decodes both channels to ladder indices and computes the module ID
+# arithmetically:
+#
+#     module_id = idx6 * 11 + idx7 + 1
+#
+# This covers all 121 grid points, including the ones sheet 22 has not assigned
+# a SKU to yet (it currently defines ID1..ID36). Verified against every row of
+# the sheet 22 table: ID1=(0,0) ID11=(0,4095) ID12=(416,0) ID13=(416,416)
+# ID22=(416,4095) ID23=(816,0) ID33=(816,4095) ID34=(1231,0) ID36=(1231,816).
+#
+# Layer 2 looks the ID up for the expected build spec. A miss is expected for
+# reserved/future SKUs and is reported separately from a hardware fault.
+#
+# Format: id|cpu|ddr_type|ddr_mb|emmc_gb|wifi|description
+MODULE_SPEC=$(
+cat <<'EOF'
+1|RK3576S|LPDDR4X|2048|8|WITH|RK3576S LPDDR4X 2+8GB WITH WIFI+BT
+2|RK3576S|LPDDR4X|2048|8|WITHOUT|RK3576S LPDDR4X 2+8GB WITHOUT WIFI+BT
+3|RK3576|LPDDR4X|2048|8|WITH|RK3576 LPDDR4X 2+8GB WITH WIFI+BT
+4|RK3576|LPDDR4X|2048|8|WITHOUT|RK3576 LPDDR4X 2+8GB WITHOUT WIFI+BT
+5|RK3576S|LPDDR4|2048|8|WITH|RK3576S LPDDR4 2+8GB WITH WIFI+BT
+6|RK3576S|LPDDR4|2048|8|WITHOUT|RK3576S LPDDR4 2+8GB WITHOUT WIFI+BT
+7|RK3576|LPDDR4|2048|8|WITH|RK3576 LPDDR4 2+8GB WITH WIFI+BT
+8|RK3576|LPDDR4|2048|8|WITHOUT|RK3576 LPDDR4 2+8GB WITHOUT WIFI+BT
+9|RK3576S|LPDDR5|2048|8|WITH|RK3576S LPDDR5 2+8GB WITH WIFI+BT
+10|RK3576S|LPDDR5|2048|8|WITHOUT|RK3576S LPDDR5 2+8GB WITHOUT WIFI+BT
+11|RK3576|LPDDR5|2048|8|WITH|RK3576 LPDDR5 2+8GB WITH WIFI+BT
+12|RK3576|LPDDR5|2048|8|WITHOUT|RK3576 LPDDR5 2+8GB WITHOUT WIFI+BT
+13|RK3576S|LPDDR4X|2048|32|WITH|RK3576S LPDDR4X 2+32GB WITH WIFI+BT
+EOF
+)
+
+# Measured hardware, filled in by read_hw_actual()
+HW_CPU="UNKNOWN" HW_CPU_BIN="N/A" HW_OTP=""
+HW_DDR_TYPE="" HW_DDR_MB=0
+HW_EMMC_GIB=0 HW_EMMC_NAME=""
+HW_WIFI_PRESENT=0 HW_WIFI_INFO=""
+
+read_hw_actual() {
+    # CPU from OTP byte 8
     local otp_hex=""
     if [ -r /sys/bus/nvmem/devices/rockchip-otp0/nvmem ]; then
         if command -v hexdump >/dev/null 2>&1; then
@@ -172,40 +299,36 @@ EOF
             otp_hex="$(dd if=/sys/bus/nvmem/devices/rockchip-otp0/nvmem bs=1 skip=8 count=1 2>/dev/null | od -An -tx1 | awk 'NR==1{print "0x"$1}' || true)"
         fi
     fi
-    otp_hex="$(echo "${otp_hex}" | tr 'A-Z' 'a-z' | awk 'NR==1{print $1}')"
-
-    local cpu_otp="UNKNOWN" cpu_bin="N/A"
-    case "${otp_hex}" in
-        0x01) cpu_otp="RK3576";  cpu_bin="0" ;;
-        0x13) cpu_otp="RK3576S"; cpu_bin="3" ;;
-        0x0a) cpu_otp="RK3576J"; cpu_bin="2" ;;
-        0x0d) cpu_otp="RK3576M"; cpu_bin="1" ;;
+    HW_OTP="$(echo "${otp_hex}" | tr 'A-Z' 'a-z' | awk 'NR==1{print $1}')"
+    case "${HW_OTP}" in
+        0x01) HW_CPU="RK3576";  HW_CPU_BIN="0" ;;
+        0x13) HW_CPU="RK3576S"; HW_CPU_BIN="3" ;;
+        0x0a) HW_CPU="RK3576J"; HW_CPU_BIN="2" ;;
+        0x0d) HW_CPU="RK3576M"; HW_CPU_BIN="1" ;;
     esac
-    log "INFO" "CPU OTP: byte8=${otp_hex:-N/A} bin=$cpu_bin => $cpu_otp"
+    log "INFO" "CPU:  OTP byte8=${HW_OTP:-N/A} bin=${HW_CPU_BIN} => ${HW_CPU}"
 
-    # Read DDR info
-    local dmcinfo ddr_type ddr_mb_total
+    # DDR
+    local dmcinfo
     dmcinfo="$(cat /proc/dmcdbg/dmcinfo 2>/dev/null || true)"
-    ddr_type="$(awk -F': *' '/^DramType:/ {v=$2; gsub(/^[[:space:]]+|[[:space:]]+$/, "", v); print v; exit}' <<<"${dmcinfo}")"
-    ddr_mb_total="$(awk -F': *' '/^TotalSize:/ {sum += ($2+0)} END {print sum+0}' <<<"${dmcinfo}")"
-    log "INFO" "DDR: type=${ddr_type:-N/A} capacity=${ddr_mb_total:-0}MB"
+    HW_DDR_TYPE="$(awk -F': *' '/^DramType:/ {v=$2; gsub(/^[[:space:]]+|[[:space:]]+$/, "", v); print v; exit}' <<<"${dmcinfo}")"
+    HW_DDR_MB="$(awk -F': *' '/^TotalSize:/ {sum += ($2+0)} END {print sum+0}' <<<"${dmcinfo}")"
+    log "INFO" "DDR:  type=${HW_DDR_TYPE:-N/A} capacity=${HW_DDR_MB:-0}MB"
 
-    # Read eMMC info
-    local emmc_sectors emmc_lba emmc_gib emmc_name
+    # eMMC
+    local emmc_sectors emmc_lba
     emmc_sectors="$(awk 'NR==1{print $1+0}' /sys/block/mmcblk0/size 2>/dev/null || echo 0)"
     emmc_lba="$(awk 'NR==1{print $1+0}' /sys/block/mmcblk0/queue/logical_block_size 2>/dev/null || echo 512)"
     [ "$emmc_lba" -gt 0 ] 2>/dev/null || emmc_lba=512
-    emmc_gib="$(awk -v s="${emmc_sectors}" -v b="${emmc_lba}" 'BEGIN{printf "%.2f", (s*b)/(1024*1024*1024)}')"
-    emmc_name="$(cat /sys/bus/mmc/devices/mmc0:0001/name 2>/dev/null | awk 'NR==1{print $0}')"
-    log "INFO" "eMMC: ${emmc_gib}GiB name=${emmc_name:-N/A}"
+    HW_EMMC_GIB="$(awk -v s="${emmc_sectors}" -v b="${emmc_lba}" 'BEGIN{printf "%.2f", (s*b)/(1024*1024*1024)}')"
+    HW_EMMC_NAME="$(cat /sys/bus/mmc/devices/mmc0:0001/name 2>/dev/null | awk 'NR==1{print $0}')"
+    log "INFO" "eMMC: ${HW_EMMC_GIB}GiB name=${HW_EMMC_NAME:-N/A}"
 
-    # Detect WiFi/BT
-    local sdio_count wlan_count bcmdhd_count wifibt_info wifi_present
+    # WiFi / BT
+    local sdio_count wlan_count bcmdhd_count
     sdio_count="$(find /sys/bus/sdio/devices -mindepth 1 -maxdepth 1 2>/dev/null | wc -l | awk '{print $1+0}')"
     if [ -x /usr/bin/wifibt-util.sh ]; then
-        wifibt_info="$(/usr/bin/wifibt-util.sh info 2>/dev/null || true)"
-    else
-        wifibt_info=""
+        HW_WIFI_INFO="$(/usr/bin/wifibt-util.sh info 2>/dev/null || true)"
     fi
     if command -v ip >/dev/null 2>&1; then
         wlan_count="$(ip -o link show 2>/dev/null | awk -F': ' '/wlan/{n++} END{print n+0}')"
@@ -217,71 +340,126 @@ EOF
     else
         bcmdhd_count=0
     fi
-    wifi_present=0
-    if [ "$sdio_count" -gt 0 ] || [ -n "$wifibt_info" ] || [ "$wlan_count" -gt 0 ] || [ "$bcmdhd_count" -gt 0 ]; then
-        wifi_present=1
+    HW_WIFI_PRESENT=0
+    if [ "$sdio_count" -gt 0 ] || [ -n "$HW_WIFI_INFO" ] || [ "$wlan_count" -gt 0 ] || [ "$bcmdhd_count" -gt 0 ]; then
+        HW_WIFI_PRESENT=1
     fi
-    log "INFO" "WiFi: sdio=$sdio_count wlan=$wlan_count bcmdhd=$bcmdhd_count info='$wifibt_info'"
+    log "INFO" "WiFi: present=${HW_WIFI_PRESENT} sdio=$sdio_count wlan=$wlan_count bcmdhd=$bcmdhd_count info='${HW_WIFI_INFO}'"
+}
 
-    # Validate CPU
-    local pass_cpu="FAIL"
-    if [ "$cpu_otp" = "$best_cpu" ]; then
-        pass_cpu="PASS"
-    fi
-    log "INFO" "[CPU]   expect=$best_cpu actual=$cpu_otp => $pass_cpu"
+validate_against_spec() {
+    local exp_cpu="$1" exp_ddr_type="$2" exp_ddr_mb="$3" exp_emmc_gb="$4" exp_wifi="$5"
+    local pass_cpu="FAIL" pass_ddr_type="FAIL" pass_ddr_mb="FAIL" pass_emmc="FAIL" pass_wifi="FAIL"
 
-    # Validate DDR type
-    local pass_ddr_type="FAIL"
-    local ddr_type_upper best_ddr_type_upper
-    ddr_type_upper="$(echo "${ddr_type}" | tr '[:lower:]' '[:upper:]')"
-    best_ddr_type_upper="$(echo "${best_ddr_type}" | tr '[:lower:]' '[:upper:]')"
-    if [ -n "${ddr_type}" ] && [ "${ddr_type_upper}" = "${best_ddr_type_upper}" ]; then
-        pass_ddr_type="PASS"
-    fi
+    [ "$HW_CPU" = "$exp_cpu" ] && pass_cpu="PASS"
+    log "INFO" "[CPU]   expect=$exp_cpu actual=$HW_CPU => $pass_cpu"
 
-    # Validate DDR capacity
-    local pass_ddr_mb="FAIL"
-    if [ -n "${ddr_mb_total}" ] && [ "${ddr_mb_total}" -gt 0 ] 2>/dev/null; then
-        local low_mb=$((best_ddr_mb - 128))
-        local high_mb=$((best_ddr_mb + 128))
-        if [ "${ddr_mb_total}" -ge "$low_mb" ] && [ "${ddr_mb_total}" -le "$high_mb" ]; then
+    local a b
+    a="$(echo "${HW_DDR_TYPE}" | tr '[:lower:]' '[:upper:]')"
+    b="$(echo "${exp_ddr_type}" | tr '[:lower:]' '[:upper:]')"
+    [ -n "${HW_DDR_TYPE}" ] && [ "$a" = "$b" ] && pass_ddr_type="PASS"
+
+    if [ -n "${HW_DDR_MB}" ] && [ "${HW_DDR_MB}" -gt 0 ] 2>/dev/null; then
+        if [ "${HW_DDR_MB}" -ge $((exp_ddr_mb - 128)) ] && [ "${HW_DDR_MB}" -le $((exp_ddr_mb + 128)) ]; then
             pass_ddr_mb="PASS"
         fi
     fi
-    log "INFO" "[DDR]   expect=$best_ddr_type/${best_ddr_mb}MB actual=${ddr_type:-N/A}/${ddr_mb_total:-0}MB => type:$pass_ddr_type cap:$pass_ddr_mb"
+    log "INFO" "[DDR]   expect=$exp_ddr_type/${exp_ddr_mb}MB actual=${HW_DDR_TYPE:-N/A}/${HW_DDR_MB:-0}MB => type:$pass_ddr_type cap:$pass_ddr_mb"
 
-    # Validate eMMC capacity
-    local pass_emmc="FAIL"
     local emmc_exp_gib
-    emmc_exp_gib="$(awk -v g="${best_emmc_gb}" 'BEGIN{printf "%.2f", (g*1000*1000*1000)/(1024*1024*1024)}')"
-    if awk -v real="${emmc_gib}" -v tgt="${emmc_exp_gib}" 'BEGIN{d=real-tgt; if(d<0)d=-d; exit !(d <= 1.20)}'; then
+    emmc_exp_gib="$(awk -v g="${exp_emmc_gb}" 'BEGIN{printf "%.2f", (g*1000*1000*1000)/(1024*1024*1024)}')"
+    if awk -v real="${HW_EMMC_GIB}" -v tgt="${emmc_exp_gib}" 'BEGIN{d=real-tgt; if(d<0)d=-d; exit !(d <= 1.20)}'; then
         pass_emmc="PASS"
     fi
-    log "INFO" "[eMMC]  expect=${best_emmc_gb}GB(~${emmc_exp_gib}GiB) actual=${emmc_gib}GiB name=${emmc_name:-N/A} => $pass_emmc"
+    log "INFO" "[eMMC]  expect=${exp_emmc_gb}GB(~${emmc_exp_gib}GiB) actual=${HW_EMMC_GIB}GiB name=${HW_EMMC_NAME:-N/A} => $pass_emmc"
 
-    # Validate WiFi presence
-    local pass_wifi="FAIL"
-    if [ "${best_wifi}" = "WITHOUT" ]; then
-        if [ "$sdio_count" -eq 0 ] && [ -z "$wifibt_info" ] && [ "$wlan_count" -eq 0 ] && [ "$bcmdhd_count" -eq 0 ]; then
-            pass_wifi="PASS"
-        fi
+    if [ "${exp_wifi}" = "WITHOUT" ]; then
+        [ "$HW_WIFI_PRESENT" -eq 0 ] && pass_wifi="PASS"
     else
-        if [ "$wifi_present" -eq 1 ]; then
-            pass_wifi="PASS"
-        fi
+        [ "$HW_WIFI_PRESENT" -eq 1 ] && pass_wifi="PASS"
     fi
-    log "INFO" "[WiFi]  expect=$best_wifi => $pass_wifi"
+    log "INFO" "[WiFi]  expect=$exp_wifi actual=$( [ "$HW_WIFI_PRESENT" -eq 1 ] && echo WITH || echo WITHOUT ) => $pass_wifi"
 
-    # Overall result
-    local total_pass="FAIL"
-    if [ "$pass_cpu" = "PASS" ] && [ "$pass_ddr_type" = "PASS" ] && [ "$pass_ddr_mb" = "PASS" ] && [ "$pass_emmc" = "PASS" ] && [ "$pass_wifi" = "PASS" ]; then
-        total_pass="PASS"
-    fi
-    log "INFO" "Hardware configuration check $total_pass"
-
-    if [ "$total_pass" = "PASS" ]; then
+    if [ "$pass_cpu" = "PASS" ] && [ "$pass_ddr_type" = "PASS" ] && \
+       [ "$pass_ddr_mb" = "PASS" ] && [ "$pass_emmc" = "PASS" ] && [ "$pass_wifi" = "PASS" ]; then
         return 0
     fi
+    return 1
+}
+
+test_hwcfg() {
+    log "INFO" "==> Module ID / hardware configuration check (channel 6, 7)"
+
+    check_samples || return 1
+
+    local adc_dev
+    adc_dev="$(find_adc_dev 6 7 || true)"
+    if [ -z "$adc_dev" ]; then
+        log "ERROR" "No IIO ADC node with voltage6~7 found"
+        return 1
+    fi
+
+    local n6 avg6 min6 max6 n7 avg7 min7 max7
+    read -r n6 avg6 min6 max6 <<<"$(adc_sample "$adc_dev" 6 "$SAMPLES")"
+    read -r n7 avg7 min7 max7 <<<"$(adc_sample "$adc_dev" 7 "$SAMPLES")"
+    if [ "$n6" -eq 0 ] || [ "$n7" -eq 0 ]; then
+        log "ERROR" "No valid channel 6/7 sample"
+        return 1
+    fi
+    log "INFO" "Channel 6: n=$n6 avg=$avg6 range=[$min6..$max6]"
+    log "INFO" "Channel 7: n=$n7 avg=$avg7 range=[$min7..$max7]"
+
+    # ---- layer 1: ladder decode -> module ID (never needs the spec table) ----
+    local d6 d7 idx6 nom6 dev6 idx7 nom7 dev7 module_id
+    if ! d6="$(ladder_index "$avg6")"; then
+        log "ERROR" "Channel 6 raw=$avg6 is not on the resistor ladder (tolerance +-${LADDER_TOL})"
+        log "ERROR" "Module ID strap resistor is wrong/unfitted, or the ADC input is faulty"
+        return 1
+    fi
+    if ! d7="$(ladder_index "$avg7")"; then
+        log "ERROR" "Channel 7 raw=$avg7 is not on the resistor ladder (tolerance +-${LADDER_TOL})"
+        log "ERROR" "Module ID strap resistor is wrong/unfitted, or the ADC input is faulty"
+        return 1
+    fi
+    read -r idx6 nom6 dev6 <<<"$d6"
+    read -r idx7 nom7 dev7 <<<"$d7"
+    report_ladder "Channel 6 (MODULE_ID hi)" "$idx6" "$nom6" "$dev6"
+    report_ladder "Channel 7 (MODULE_ID lo)" "$idx7" "$nom7" "$dev7"
+
+    # Sheet 22 numbers the rows CONF_ID1..CONF_ID36, i.e. 1-based
+    module_id=$(( idx6 * LADDER_LEVELS + idx7 + 1 ))
+    log "INFO" "Decoded: ch6 idx=${idx6} ch7 idx=${idx7} => CONF_ID${module_id}"
+
+    # ---- layer 2: spec lookup (a miss is not a hardware fault) --------------
+    local spec exp_cpu exp_ddr_type exp_ddr_mb exp_emmc_gb exp_wifi exp_text
+    spec="$(awk -F'|' -v id="$module_id" '$1 == id { print; exit }' <<<"${MODULE_SPEC}")"
+
+    read_hw_actual
+
+    if [ -z "$spec" ]; then
+        log "WARN" "MODULE_ID=${module_id} has no build spec defined in this script"
+        log "WARN" "Sheet 22 currently assigns SKUs up to ID36; the rest are reserved."
+        log "WARN" "The strap itself decoded cleanly, so this is not a hardware fault."
+        log "WARN" "Measured inventory: CPU=${HW_CPU} DDR=${HW_DDR_TYPE:-N/A}/${HW_DDR_MB}MB" \
+                   "eMMC=${HW_EMMC_GIB}GiB WiFi=$( [ "$HW_WIFI_PRESENT" -eq 1 ] && echo WITH || echo WITHOUT )"
+        if [ "$ALLOW_UNKNOWN_MODULE_ID" = "1" ]; then
+            log "WARN" "ALLOW_UNKNOWN_MODULE_ID=1, reporting only -- no cross-check performed"
+            log "INFO" "Module ID check PASSED (unverified, MODULE_ID=${module_id})"
+            return 0
+        fi
+        log "ERROR" "Add MODULE_ID=${module_id} to MODULE_SPEC, or set ALLOW_UNKNOWN_MODULE_ID=1"
+        log "ERROR" "Module ID check FAILED (unknown MODULE_ID=${module_id})"
+        return 1
+    fi
+
+    IFS='|' read -r _ exp_cpu exp_ddr_type exp_ddr_mb exp_emmc_gb exp_wifi exp_text <<<"${spec}"
+    log "INFO" "MODULE_ID=${module_id} => ${exp_text}"
+
+    if validate_against_spec "$exp_cpu" "$exp_ddr_type" "$exp_ddr_mb" "$exp_emmc_gb" "$exp_wifi"; then
+        log "INFO" "Hardware configuration check PASS"
+        return 0
+    fi
+    log "ERROR" "Hardware configuration check FAIL"
     return 1
 }
 
@@ -289,13 +467,16 @@ EOF
 test_adc_voltage
 rc_voltage=$?
 
+test_core_rev
+rc_rev=$?
+
 test_hwcfg
 rc_hwcfg=$?
 
-if [ $rc_voltage -eq 0 ] && [ $rc_hwcfg -eq 0 ]; then
+if [ $rc_voltage -eq 0 ] && [ $rc_rev -eq 0 ] && [ $rc_hwcfg -eq 0 ]; then
     log "INFO" "ADC test PASSED"
     exit 0
 else
-    log "ERROR" "ADC test FAILED (voltage=$rc_voltage hwcfg=$rc_hwcfg)"
+    log "ERROR" "ADC test FAILED (voltage=$rc_voltage core_rev=$rc_rev hwcfg=$rc_hwcfg)"
     exit 1
 fi
