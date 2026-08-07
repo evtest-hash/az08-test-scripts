@@ -18,6 +18,19 @@ if ! command -v fio >/dev/null 2>&1; then
     exit 1
 fi
 
+# typec.sh re-enumerates the gadget on the same hub uplink, which drags down the
+# throughput measured here. Serialise the two.
+LOCK_FILE="${LOCK_FILE:-/tmp/.az08_usb_bus.lock}"
+if command -v flock >/dev/null 2>&1 && exec 9>"$LOCK_FILE" 2>/dev/null; then
+    if ! flock -n 9 2>/dev/null; then
+        log "INFO" "Another USB test holds ${LOCK_FILE}, waiting..."
+        flock 9
+    fi
+    log "INFO" "Holding USB bus lock ${LOCK_FILE}"
+else
+    log "WARN" "flock not available; running without the USB bus mutex"
+fi
+
 find_usb_block_devs_by_ctrl() {
     local ctrl="$1"
     for link in /sys/block/sd*; do
