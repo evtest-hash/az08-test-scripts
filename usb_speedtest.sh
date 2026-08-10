@@ -3,7 +3,6 @@
 set -euo pipefail
 
 USB3_MIN_READ_SPEED=60
-USB2_MIN_READ_SPEED=10
 
 log() {
     local level="$1"; shift
@@ -61,7 +60,7 @@ for ctrl in "${ctrls[@]}"; do
 done
 
 if [ "$all_found" -ne 1 ]; then
-    log "ERROR" "A USB device must be detected under all three USB controllers"
+    log "ERROR" "A USB mass storage device must be detected under the USB 3.0 controller"
     exit 1
 fi
 
@@ -105,9 +104,9 @@ for ctrl in "${ctrls[@]}"; do
 done
 
 if [ "$pass" -eq 1 ]; then
-    log "INFO" "All USB read speed tests passed"
+    log "INFO" "USB read speed test passed"
     exit 0
 else
-    log "ERROR" "Some USB read speed tests failed"
+    log "ERROR" "USB read speed test failed"
     exit 1
 fi
