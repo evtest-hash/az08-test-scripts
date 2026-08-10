@@ -18,7 +18,7 @@ test_bluetooth_wifi() {
 
     log "INFO" "Scanning for WiFi hotspots..."
     wifi_scan=$(iwlist wlan0 scanning | grep "ESSID")
-    wifi_count=$(echo "$wifi_scan" | wc -l)
+    wifi_count=$(echo "$wifi_scan" | grep -v "^\s*$" | wc -l)
     if [ "$wifi_count" -eq 0 ]; then
         log "ERROR" "No WiFi hotspots found"
         return 1
