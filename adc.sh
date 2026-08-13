@@ -396,9 +396,45 @@ validate_against_spec() {
     fi
     log "INFO" "[DDR]   expect=$exp_ddr_type/${exp_ddr_mb}MB actual=${HW_DDR_TYPE:-N/A}/${HW_DDR_MB:-0}MB => type:$pass_ddr_type cap:$pass_ddr_mb"
 
+    # eMMC user area is always smaller than the nominal density: JEDEC defines no
+    # nominal-density field at all (the part only reports SEC_COUNT), and vendors
+    # subtract boot/RPMB partitions plus management area from it. The shortfall is
+    # proportional, not fixed, and it differs per vendor:
+    #
+    #   Samsung Table 18   64GB -> 62,537,072,640 B = 58.24GiB   0.977 of nominal
+    #   Flexxon Ind 5.1     8GB ->  7,834,959,872 B =  7.30GiB   0.979
+    #   Micron MTFC8GAKAJCN 8GB ->                     7.09GiB   0.952
+    #   Gateworks floor    64GB -> 61,203,283,968 B = 57.00GiB   0.956
+    #
+    # So a fixed +-GiB window cannot work: it must be wide enough for 0.952 yet
+    # the shortfall doubles with every capacity tier. Compare by ratio instead.
+    #
+    # Bound at /*sqrt(2) -- the geometric midpoint between adjacent capacity tiers.
+    # This is AOSP roundStorageSize's ladder, but centred on the tier instead of
+    # sitting at its top edge, so the margin is balanced on both sides:
+    #
+    #   real material  0.952..0.979  ->  1.346x above the 0.7071 bound   (no false FAIL)
+    #   32GB mis-stuff 0.489..0.537  ->  1.32x  below it                 (no missed FAIL)
+    #
+    # The 32GB figure allows for a part exposing its full *binary* 32GiB (0.537),
+    # which AOSP's top-edge window would misread as the next tier up. 128GB
+    # mis-stuff lands at 1.90 and a missing/unenumerated eMMC reads 0.00; both
+    # fall outside. Second-source material passes on capacity alone -- no vendor
+    # table to keep in sync, so new material cannot stop the line.
+    #
+    # PRECONDITION on sqrt(2): it is the midpoint for tiers 2x apart. A mis-stuffed
+    # density S is only rejected reliably when S/expected is outside 0.722..1.486
+    # (0.7071/0.9794 and 1.4142/0.9516). Every eMMC density is a power of two, so
+    # neighbours sit at 0.5x / 2.0x and clear that band easily -- but this holds
+    # only while MODULE_SPEC stays on the power-of-two ladder. Adding a density
+    # such as 48GB alongside 64GB (0.75x) would be silently accepted here; that
+    # pair needs sqrt(48/64)=1.155, which leaves only 1.10x over real material,
+    # i.e. capacity can no longer identify the part and CID/PNM must do it.
+    # Capacities currently in MODULE_SPEC: 8 / 32 / 64 -- all powers of two.
     local emmc_exp_gib
     emmc_exp_gib="$(awk -v g="${exp_emmc_gb}" 'BEGIN{printf "%.2f", (g*1000*1000*1000)/(1024*1024*1024)}')"
-    if awk -v real="${HW_EMMC_GIB}" -v tgt="${emmc_exp_gib}" 'BEGIN{d=real-tgt; if(d<0)d=-d; exit !(d <= 1.20)}'; then
+    if awk -v real="${HW_EMMC_GIB}" -v tgt="${emmc_exp_gib}" \
+        'BEGIN{ exit !(tgt > 0 && real > tgt/1.4142 && real <= tgt*1.4142) }'; then
         pass_emmc="PASS"
     fi
     log "INFO" "[eMMC]  expect=${exp_emmc_gb}GB(~${emmc_exp_gib}GiB) actual=${HW_EMMC_GIB}GiB name=${HW_EMMC_NAME:-N/A} => $pass_emmc"
