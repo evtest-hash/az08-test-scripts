@@ -18,7 +18,7 @@ Production-line test scripts for the AZ08 hardware platform. Each script targets
 | 10 | **Type-C** | [`typec.sh`](./typec.sh) | 10s | Two-pass gadget self-loop over sysfs (VID=2207): Pass A expects a SuperSpeed link (5000 Mbps), Pass B caps the gadget at high-speed and expects re-enumeration at 480 Mbps; covers 14/18 core board USB pins |
 | 11 | **eMMC** | [`emmc.sh`](./emmc.sh) | 10s | 64 MB random data write (`dd conv=fsync`), page cache drop, direct I/O read-back with integrity check and speed measurement |
 | 12 | **RAM** | [`ram.py`](./ram.py) | 30s | Allocates 80% of available memory via `mmap`, writes repeating byte pattern, verifies every byte |
-| 13 | **WiFi / BT** | [`wifibt.sh`](./wifibt.sh) | 30s | WiFi hotspot scan via `iwlist` + Bluetooth LE device scan via `hcitool lescan` |
+| 13 | **WiFi / BT** | [`wifibt.sh`](./wifibt.sh) | 30s | WiFi hotspot scan via `iwlist` (up to 3 attempts — the first scan can hit EAGAIN right after `killall wpa_supplicant`) + Bluetooth LE device scan via `hcitool lescan` |
 
 ## Execution Flow
 

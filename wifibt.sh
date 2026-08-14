@@ -17,8 +17,20 @@ test_bluetooth_wifi() {
     fi
 
     log "INFO" "Scanning for WiFi hotspots..."
-    wifi_scan=$(iwlist wlan0 scanning | grep "ESSID")
-    wifi_count=$(echo "$wifi_scan" | grep -v "^\s*$" | wc -l)
+    # Retry: right after killall, the driver may still be aborting a scan that
+    # wpa_supplicant had in flight, and iwlist then fails with EAGAIN.
+    scan_attempts=3
+    attempt=1
+    while :; do
+        wifi_scan=$(iwlist wlan0 scanning | grep "ESSID")
+        wifi_count=$(echo "$wifi_scan" | grep -v "^\s*$" | wc -l)
+        if [ "$wifi_count" -gt 0 ] || [ "$attempt" -ge "$scan_attempts" ]; then
+            break
+        fi
+        log "WARN" "WiFi scan attempt $attempt/$scan_attempts found nothing, retrying in 2s..."
+        attempt=$((attempt + 1))
+        sleep 2
+    done
     if [ "$wifi_count" -eq 0 ]; then
         log "ERROR" "No WiFi hotspots found"
         return 1
