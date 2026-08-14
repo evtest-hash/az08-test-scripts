@@ -17,8 +17,9 @@ test_bluetooth_wifi() {
     fi
 
     log "INFO" "Scanning for WiFi hotspots..."
-    # Retry: right after killall, the driver may still be aborting a scan that
-    # wpa_supplicant had in flight, and iwlist then fails with EAGAIN.
+    # Retry with a wlan0 reset in between: killing wpa_supplicant mid-scan can
+    # wedge the driver's WEXT scan path (iwlist then returns empty instantly and
+    # stays that way for 30s+); a down/up cycle clears it deterministically.
     scan_attempts=3
     attempt=1
     while :; do
@@ -27,9 +28,12 @@ test_bluetooth_wifi() {
         if [ "$wifi_count" -gt 0 ] || [ "$attempt" -ge "$scan_attempts" ]; then
             break
         fi
-        log "WARN" "WiFi scan attempt $attempt/$scan_attempts found nothing, retrying in 2s..."
+        log "WARN" "WiFi scan attempt $attempt/$scan_attempts found nothing, resetting wlan0 and retrying..."
         attempt=$((attempt + 1))
-        sleep 2
+        ifconfig wlan0 down
+        sleep 1
+        ifconfig wlan0 up
+        sleep 1
     done
     if [ "$wifi_count" -eq 0 ]; then
         log "ERROR" "No WiFi hotspots found"
