@@ -15,7 +15,7 @@ Production-line test scripts for the AZ08 hardware platform. Each script targets
 | 7 | **SD Card** | [`sdcard.sh`](./sdcard.sh) | 10s | SD card detection (`/dev/mmcblk1`), mount, 4 KB random data write-back-read with `cmp` verification |
 | 8 | **SPI Flash** | [`spi.sh`](./spi.sh) | 10s | Single MTD device (`mtdblock0`, U14 BY25D40ESTIG on SPI3_M2 CS0) erase, write, read-back, and `cmp` comparison |
 | 9 | **USB** | [`usb_speedtest.sh`](./usb_speedtest.sh) | 30s | `fio` sequential read benchmark on USB mass storage (512 MB, 1 MB block, direct I/O, threshold ≥ 60 MB/s) |
-| 10 | **Type-C** | [`typec.sh`](./typec.sh) | 10s | Two-pass gadget self-loop over sysfs (VID=2207): Pass A expects a SuperSpeed link (5000 Mbps), Pass B caps the gadget at high-speed and expects re-enumeration at 480 Mbps; covers 14/18 core board USB pins |
+| 10 | **Type-C** | [`typec.sh`](./typec.sh) | 30s | Two-pass gadget self-loop over sysfs (VID=2207): Pass A expects a SuperSpeed link (5000 Mbps), Pass B caps the gadget at high-speed and expects re-enumeration at 480 Mbps; covers 14/18 core board USB pins |
 | 11 | **eMMC** | [`emmc.sh`](./emmc.sh) | 10s | 64 MB random data write (`dd conv=fsync`), page cache drop, direct I/O read-back with integrity check and speed measurement |
 | 12 | **RAM** | [`ram.py`](./ram.py) | 30s | Allocates 80% of available memory via `mmap`, writes repeating byte pattern, verifies every byte |
 | 13 | **WiFi / BT** | [`wifibt.sh`](./wifibt.sh) | 30s | WiFi hotspot scan via `iwlist` (up to 3 attempts — the first scan can hit EAGAIN right after `killall wpa_supplicant`) + Bluetooth LE device scan via `hcitool lescan` |

@@ -17,7 +17,6 @@ SPEED_SS="5000"
 SPEED_HS="480"
 ENUM_TIMEOUT="${ENUM_TIMEOUT:-10}"
 DEFAULT_MAX_SPEED="${DEFAULT_MAX_SPEED:-super-speed-plus}"
-LOCK_FILE="${LOCK_FILE:-/tmp/.az08_usb_bus.lock}"
 
 USB_DEVICES="/sys/bus/usb/devices"
 GADGET_DIR=""
@@ -30,21 +29,6 @@ log() {
     local ts
     ts="$(date '+%Y-%m-%d %H:%M:%S')"
     echo "[$ts] [$$] [$level] $msg"
-}
-
-# The gadget re-enumeration in Pass B perturbs the hub uplink that
-# usb_speedtest.sh measures throughput on. Both scripts take this lock.
-acquire_usb_lock() {
-    if ! command -v flock >/dev/null 2>&1; then
-        log "WARN" "flock not available; running without the USB bus mutex"
-        return 0
-    fi
-    exec 9>"$LOCK_FILE" 2>/dev/null || return 0
-    if ! flock -n 9 2>/dev/null; then
-        log "INFO" "Another USB test holds ${LOCK_FILE}, waiting..."
-        flock 9
-    fi
-    log "INFO" "Holding USB bus lock ${LOCK_FILE}"
 }
 
 find_usb_dev() {
@@ -76,6 +60,26 @@ wait_for_speed() {
         waited=$((waited + 1))
     done
     return 1
+}
+
+diagnose_superspeed_failure() {
+    local d n=0
+    log "INFO" "USB bus census:"
+    for d in "${USB_DEVICES}"/*-*; do
+        [ -f "${d}/idVendor" ] || continue
+        log "INFO" "$(printf '  %-8s %s:%s speed=%-5s %s' "$(basename "$d")" \
+            "$(cat "${d}/idVendor")" "$(cat "${d}/idProduct")" \
+            "$(cat "${d}/speed")" "$(cat "${d}/product" 2>/dev/null)")"
+        case "$d" in "${USB_DEVICES}"/2-*) n=$((n + 1)) ;; esac
+    done
+    if [ "$n" -eq 0 ]; then
+        log "ERROR" "SS bus is empty -- even the hub did not train SuperSpeed."
+        log "ERROR" "Shared-segment fault: check the loop cable, the hub, then OTG1"
+        log "ERROR" "SS pins 119/120/122/123. OTG0 pins are NOT implicated by this."
+    else
+        log "ERROR" "Hub uplink trained SS but the gadget did not."
+        log "ERROR" "Fault is on the Type-C side -- check OTG0 SS pins 107/108/110/111."
+    fi
 }
 
 describe_dev() {
@@ -220,6 +224,7 @@ pass_a_superspeed() {
             log "ERROR" "SuperSpeed link failed -- check pins 107/108/110/111 (OTG0) and 119/120/122/123 (OTG1)"
             describe_dev "$dev"
         fi
+        diagnose_superspeed_failure
         return 1
     fi
     log "INFO" "SuperSpeed link up:"
@@ -262,7 +267,6 @@ main() {
     local rc=0
 
     log "INFO" "==> Type-C self-loop test (VID=${VENDOR_ID})"
-    acquire_usb_lock
     recover_missing_gadget
 
     if ! check_gadget; then

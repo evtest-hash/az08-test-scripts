@@ -17,19 +17,6 @@ if ! command -v fio >/dev/null 2>&1; then
     exit 1
 fi
 
-# typec.sh re-enumerates the gadget on the same hub uplink, which drags down the
-# throughput measured here. Serialise the two.
-LOCK_FILE="${LOCK_FILE:-/tmp/.az08_usb_bus.lock}"
-if command -v flock >/dev/null 2>&1 && exec 9>"$LOCK_FILE" 2>/dev/null; then
-    if ! flock -n 9 2>/dev/null; then
-        log "INFO" "Another USB test holds ${LOCK_FILE}, waiting..."
-        flock 9
-    fi
-    log "INFO" "Holding USB bus lock ${LOCK_FILE}"
-else
-    log "WARN" "flock not available; running without the USB bus mutex"
-fi
-
 find_usb_block_devs_by_ctrl() {
     local ctrl="$1"
     for link in /sys/block/sd*; do
@@ -37,6 +24,19 @@ find_usb_block_devs_by_ctrl() {
             basename "$link"
             return 0
         fi
+    done
+    return 1
+}
+
+usb_link_speed_for_block() {
+    local p
+    p="$(readlink -f "/sys/block/$1" 2>/dev/null)" || return 1
+    while [ -n "$p" ] && [ "$p" != "/" ]; do
+        if [ -f "$p/speed" ] && [ -f "$p/idVendor" ]; then
+            cat "$p/speed"
+            return 0
+        fi
+        p="$(dirname "$p")"
     done
     return 1
 }
@@ -68,8 +68,20 @@ pass=1
 for ctrl in "${ctrls[@]}"; do
     device="/dev/${devs[$ctrl]}"
     min_read="${ctrl_min_read[$ctrl]}"
+
+    link_speed="$(usb_link_speed_for_block "${devs[$ctrl]}" 2>/dev/null || true)"
+    log "INFO" "$device USB link speed: ${link_speed:-unknown} Mbps"
+    if [ "$link_speed" != "5000" ]; then
+        log "ERROR" "$device link trained at ${link_speed:-unknown} Mbps, not 5000 (SuperSpeed)"
+        log "ERROR" "This is a link fault, not a storage fault -- do not swap the stick first."
+        pass=0
+        continue
+    fi
+
     log "INFO" "Testing $device (USB controller $ctrl, min read: ${min_read}MB/s)"
 
+    fio_err="$(mktemp)"
+    fio_rc=0
     fio_output=$(fio --name=usb-read-test \
         --filename="$device" \
         --rw=read \
@@ -78,16 +90,21 @@ for ctrl in "${ctrls[@]}"; do
         --direct=1 \
         --runtime=5 \
         --time_based \
-        --output-format=terse 2>/dev/null)
+        --output-format=terse 2>"$fio_err") || fio_rc=$?
 
-    if [ $? -ne 0 ] || [ -z "$fio_output" ]; then
-        log "ERROR" "Read test failed: $device"
+    if [ "$fio_rc" -ne 0 ] || [ -z "$fio_output" ]; then
+        log "ERROR" "Read test failed: $device (fio exit ${fio_rc}): $(tr '\n' ' ' < "$fio_err")"
+        rm -f "$fio_err"
         pass=0
         continue
     fi
+    rm -f "$fio_err"
 
-    read_speed=$(echo "$fio_output" | awk -F';' '{ printf("%.2f", $7/1024) }')
-    read_speed_int=$(printf "%.0f" "$read_speed")
+    read_speed=$(echo "$fio_output" | awk -F';' 'NF>=7 { printf("%.2f", $7/1024); exit }')
+    case "$read_speed" in
+        ''|*[!0-9.]*) read_speed="" ;;
+    esac
+    read_speed_int=$(printf "%.0f" "${read_speed:-0}")
 
     if [ -n "$read_speed" ]; then
         log "INFO" "$device Read speed: ${read_speed} MB/s"
